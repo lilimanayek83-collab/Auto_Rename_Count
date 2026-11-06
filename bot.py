@@ -1,3 +1,4 @@
+
 #bot02_simplified.py
 # ==================== IMPORTS & CONFIG ====================
 import asyncio
@@ -18,6 +19,10 @@ import datetime
 import shutil
 import subprocess
 import heapq
+import unicodedata
+import inspect
+import glob
+from functools import lru_cache
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 from dotenv import load_dotenv
@@ -29,7 +34,7 @@ from pyrogram.types import (
     Message, InlineKeyboardButton, InlineKeyboardMarkup
 )
 from pyrogram.errors import FloodWait, BadRequest
-from pyrogram.enums import ChatMemberStatus
+from pyrogram.enums import ChatMemberStatus, ParseMode
 
 # Attempt to speed up Pyrogram with tgcrypto
 try:
@@ -81,6 +86,11 @@ class Txt:
 • /delete_cover - Remove your saved cover image
 • /delete_metadata - Delete metadata settings
 • /mediatype - Choose output media type (Document/Video/Audio) – with buttons!
+• /add_pattern [pattern] - Save a custom pattern, e.g. S{season} -  E{episode} [{quality} ⌯
+• /patterns - List your saved patterns
+• /del_pattern [n|all] - Remove saved pattern(s)
+• /identify_from [filename|caption] - Where to read season/episode/quality from
+• Wrap text in &lt; &gt; inside /autorename or /set_caption to make it <b>bold</b> in the caption, e.g. <code>&lt;Episode: {episode}&gt;</code>
 
 <b>📊 View Commands:</b>
 • /view_caption - View your caption
@@ -96,7 +106,7 @@ class Txt:
 • /start_renaming - Resume renaming queue (Admin)
 • /admin_priority_on - Enable admin priority (Admin)
 • /admin_priority_off - Disable admin priority (Admin)
-• /clear_queue_user [user_id] - Clear your queued files (Admins can specify a user ID)
+• /clear_queue_user - Clear your own queued files (Admins can add a user ID)
 • /skip_failed - Skip current manual rename request
 
 <b>🔄 Sequence Sorting:</b>
@@ -109,9 +119,10 @@ class Txt:
 
 <b>👑 Admin Commands:</b>
 • /stats - Bot statistics
-• /clear_queue - Clear entire processing queue
+• /clear_queue - Stop current task + clear ALL users' queues
 • /broadcast - Broadcast message
 • /set_channel - Register the cover/thumbnail storage channel (forward a message from it after making the bot admin there)
+• /add_pattern_channel - Send INSIDE a channel (bot = admin) to register the pattern storage channel
 
 <b>📖 Guide:</b>
 1. First use setup commands
@@ -151,22 +162,25 @@ def get_msg_fname(msg: Message) -> str:
     if msg.audio:    return msg.audio.file_name    or 'audio.mp3'
     return 'file'
 
-def sort_key_for_mode(msg: Message, mode: int):
-    fname = get_msg_fname(msg)
-    season, quality, episode = extract_file_info(fname)
+def sort_key_for_mode(msg: Message, mode: int, source: str = 'filename', patterns: list = None):
+    i = extract_variables(msg, get_msg_fname(msg), source, patterns or [])
+    season, quality, episode = i['season'], quality_to_int(i['quality']), i['episode']
     if   mode == 1: return (season, quality, episode)
     elif mode == 2: return (season, episode, quality)
     else:           return (quality, season, episode)
 
-def generate_sort_summary(sorted_files: list, mode: int) -> str:
+def generate_sort_summary(sorted_files: list, mode: int, source: str = 'filename', patterns: list = None) -> str:
     if not sorted_files:
         return "No files."
+    def info(m):
+        i = extract_variables(m, get_msg_fname(m), source, patterns or [])
+        return i['season'], quality_to_int(i['quality']), i['episode']
     lines: List[str] = []
     if mode == 1:
         lines.append("🔀 **Sorted: Season › Quality › Episode**\n")
         last_s = last_q = None
         for msg in sorted_files:
-            s, q, e = extract_file_info(get_msg_fname(msg))
+            s, q, e = info(msg)
             if s != last_s or q != last_q:
                 lines.append(f"\n**S{s:02d} {quality_label(q)}:**")
             lines.append(f"  Ep{e:02d} - `{get_msg_fname(msg)[:40]}`")
@@ -175,7 +189,7 @@ def generate_sort_summary(sorted_files: list, mode: int) -> str:
         lines.append("🔀 **Sorted: Season › Episode › Quality**\n")
         last_s = last_e = None
         for msg in sorted_files:
-            s, q, e = extract_file_info(get_msg_fname(msg))
+            s, q, e = info(msg)
             if s != last_s or e != last_e:
                 lines.append(f"\n**S{s:02d} Ep{e:02d}:**")
             lines.append(f"  {quality_label(q)} - `{get_msg_fname(msg)[:40]}`")
@@ -184,7 +198,7 @@ def generate_sort_summary(sorted_files: list, mode: int) -> str:
         lines.append("🔀 **Sorted: Quality › Season › Episode**\n")
         last_q = last_s = None
         for msg in sorted_files:
-            s, q, e = extract_file_info(get_msg_fname(msg))
+            s, q, e = info(msg)
             if q != last_q or s != last_s:
                 lines.append(f"\n**{quality_label(q)} - S{s:02d}:**")
             lines.append(f"  Ep{e:02d} - `{get_msg_fname(msg)[:40]}`")
@@ -277,6 +291,8 @@ class PriorityQueue:
         self.timeout_seconds = Config.TIMEOUT_SECONDS
         self.user_tasks = {}
         self.task_map = {}
+        self.current_job = None      # asyncio.Task running process_queue_file
+        self.cancelled_tasks = 0
 
     def _base_item(self, message: Message, user_id: int, manual_filename: Optional[str], task_id: str, queue_position: int):
         priority = 0 if user_id in Config.ADMIN else 1
@@ -366,23 +382,65 @@ class PriorityQueue:
         self.task_map.clear()
 
     async def clear_user_queue(self, user_id: int) -> Tuple[int, bool]:
-        async with self.lock:
-            removed_count = 0
-            has_current = False
-            if self.is_processing and self.current_task and self.current_task['user_id'] == user_id:
-                has_current = True
-            if user_id in self.user_tasks:
-                for task_id in list(self.user_tasks[user_id]):
-                    task = self.task_map.get(task_id)
-                    if task and task_id != self.current_task_id:
-                        if not task.get('cancelled', False):
-                            task['cancelled'] = True
-                            removed_count += 1
-                if has_current:
-                    self.user_tasks[user_id] = [self.current_task_id]
-                else:
-                    del self.user_tasks[user_id]
-            return removed_count, has_current
+        # NOTE: no `self.lock` here. queue_worker holds that lock for the whole
+        # duration of a file, so taking it here made the command hang until
+        # the current file finished. This body has no awaits -> already atomic.
+        removed_count = 0
+        has_current = bool(
+            self.is_processing and self.current_task and self.current_task['user_id'] == user_id
+        )
+        for task_id in list(self.user_tasks.get(user_id, [])):
+            task = self.task_map.get(task_id)
+            if task and task.get('status') == 'waiting' and not task.get('cancelled', False):
+                task['cancelled'] = True
+                removed_count += 1
+        if has_current:
+            self.user_tasks[user_id] = [self.current_task_id]
+        else:
+            self.user_tasks.pop(user_id, None)
+        return removed_count, has_current
+
+    def cancel_current(self) -> bool:
+        job = self.current_job
+        if job and not job.done():
+            job.cancel()
+            return True
+        return False
+
+    def cancel_task(self, task_id: str) -> str:
+        """'running' | 'queued' | 'gone'"""
+        if self.is_processing and self.current_task_id == task_id:
+            return 'running' if self.cancel_current() else 'gone'
+        task = self.task_map.get(task_id)
+        if task and task.get('status') == 'waiting' and not task.get('cancelled', False):
+            task['cancelled'] = True
+            return 'queued'
+        return 'gone'
+
+    def clear_all(self):
+        """Admin /clear_queue: drop every waiting task of every user AND
+        cancel the running job. Returns (affected_user_ids, removed_waiting, stopped_current)."""
+        users, removed = set(), 0
+        for item in self.queue:
+            t = item[3]
+            if not t.get('cancelled', False):
+                removed += 1
+                users.add(t['user_id'])
+        if self.is_processing and self.current_task:
+            users.add(self.current_task['user_id'])
+        self.clear_queue()
+        stopped = self.cancel_current()
+        return users, removed, stopped
+
+    def forget_task(self, task):
+        """Called when a task finished/cancelled, so finished tasks don't pile up."""
+        tid, uid = task['task_id'], task['user_id']
+        self.task_map.pop(tid, None)
+        lst = self.user_tasks.get(uid)
+        if lst and tid in lst:
+            lst.remove(tid)
+            if not lst:
+                del self.user_tasks[uid]
 
     def get_queue_info(self):
         waiting_tasks = [item for item in self.queue if not item[3].get('cancelled', False)]
@@ -439,6 +497,12 @@ class PriorityQueue:
 
 processing_queue = PriorityQueue()
 
+def _cancel_kb(task_id=None):
+    tid = task_id or processing_queue.current_task_id
+    if not tid:
+        return None
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_task_{tid}")]])
+
 class Database:
     def __init__(self):
         self.client = motor.motor_asyncio.AsyncIOMotorClient(Config.DB_URL)
@@ -473,6 +537,8 @@ class Database:
             },
             "sequence_mode": 1,
             "count": None,
+            "patterns": [],
+            "id_source": "filename",
         }
 
     async def add_user(self, user_id):
@@ -602,6 +668,67 @@ class Database:
         )
         return result.get("count") if result else None
 
+    # ---- Custom filename patterns + variable identify source ----
+    async def get_patterns(self, user_id):
+        user = await self.col.find_one({"_id": int(user_id)}, {"patterns": 1})
+        return (user or {}).get("patterns") or []
+
+    async def add_pattern(self, user_id, pattern):
+        await self.col.update_one(
+            {"_id": int(user_id)},
+            {"$addToSet": {"patterns": pattern}},
+            upsert=True
+        )
+
+    async def set_patterns(self, user_id, patterns: list):
+        await self.col.update_one(
+            {"_id": int(user_id)},
+            {"$set": {"patterns": patterns}},
+            upsert=True
+        )
+
+    async def get_id_source(self, user_id):
+        user = await self.col.find_one({"_id": int(user_id)}, {"id_source": 1})
+        return (user or {}).get("id_source") or "filename"
+
+    async def set_id_source(self, user_id, source: str):
+        await self.col.update_one(
+            {"_id": int(user_id)},
+            {"$set": {"id_source": source}},
+            upsert=True
+        )
+
+    # ---- Pattern storage channel (bot-wide) + per-user message reference ----
+    async def get_pattern_channel(self):
+        cfg = await self.config_col.find_one({"_id": "pattern_channel"})
+        return cfg.get("chat_id") if cfg else None
+
+    async def set_pattern_channel(self, chat_id):
+        await self.config_col.update_one(
+            {"_id": "pattern_channel"}, {"$set": {"chat_id": chat_id}}, upsert=True
+        )
+
+    async def get_pattern_ref(self, user_id):
+        user = await self.col.find_one(
+            {"_id": int(user_id)}, {"pattern_chat_id": 1, "pattern_message_id": 1}
+        )
+        if user and user.get("pattern_chat_id") and user.get("pattern_message_id"):
+            return {"chat_id": user["pattern_chat_id"], "message_id": user["pattern_message_id"]}
+        return None
+
+    async def set_pattern_ref(self, user_id, chat_id, message_id):
+        await self.col.update_one(
+            {"_id": int(user_id)},
+            {"$set": {"pattern_chat_id": chat_id, "pattern_message_id": message_id}},
+            upsert=True
+        )
+
+    async def clear_pattern_ref(self, user_id):
+        await self.col.update_one(
+            {"_id": int(user_id)},
+            {"$unset": {"pattern_chat_id": "", "pattern_message_id": ""}}
+        )
+
     # ---- Cover / thumbnail storage channel (bot-wide config) ----
     async def get_cover_channel(self):
         cfg = await self.config_col.find_one({"_id": "cover_channel"})
@@ -677,7 +804,7 @@ async def progress_for_pyrogram(current, total, ud_type, message, start):
 <b>» ETA</b> : {estimated_total_time if estimated_total_time else "0 s"} """
         try:
             if message and hasattr(message, 'edit'):
-                await message.edit(text=f"{ud_type}\n\n{progress}{tmp}")
+                await message.edit(text=f"{ud_type}\n\n{progress}{tmp}", reply_markup=_cancel_kb())
         except:
             pass
 
@@ -806,6 +933,7 @@ async def add_metadata_correct(input_path, output_path, user_id):
         '-y',
         output_path
     ]
+    process = process2 = None
     try:
         process = await asyncio.wait_for(
             asyncio.create_subprocess_exec(
@@ -838,6 +966,14 @@ async def add_metadata_correct(input_path, output_path, user_id):
             if process2.returncode != 0:
                 shutil.copy2(input_path, output_path)
                 return output_path
+    except asyncio.CancelledError:
+        for _p in (process, process2):
+            if _p and _p.returncode is None:
+                try:
+                    _p.kill()
+                except ProcessLookupError:
+                    pass
+        raise
     except asyncio.TimeoutError:
         shutil.copy2(input_path, output_path)
         return output_path
@@ -916,6 +1052,240 @@ def extract_file_info(file_name: str):
 
     return season, quality, episode
 
+# ==================== CUSTOM PATTERN ENGINE ====================
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F000-\U0001FAFF"   # emoji, pictographs, stickers, skin tones, flags
+    "\U00002600-\U000027BF"   # misc symbols, dingbats
+    "\U00002B00-\U00002BFF"
+    "\U000E0020-\U000E007F"   # tag chars
+    "\u20E3\uFE00-\uFE0F\u200B-\u200F\u2060\uFEFF"  # keycap, selectors, zero-width
+    "]+"
+)
+
+def clean_text(text) -> str:
+    """Normalise file name / caption so emojis, stickers, fancy fonts,
+    zero-width and control chars never break matching. Applied to BOTH
+    the text and the saved pattern, so they stay comparable."""
+    if not text:
+        return ""
+    try:
+        text = unicodedata.normalize("NFKC", str(text))   # 𝐒𝟎𝟏 -> S01, ［ -> [
+    except Exception:
+        text = str(text)
+    text = _EMOJI_RE.sub(" ", text)
+    text = "".join(
+        c for c in text
+        if unicodedata.category(c) not in ("Cc", "Cf", "Cs", "Co") or c in "\n\t"
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+_PLACEHOLDERS = {
+    'season':  r'\d{1,4}',
+    'episode': r'\d{1,4}',
+    'quality': r'(?:\d{3,4}[pi]|[248]k|uhd|fhd|qhd|hd|sd)',
+}
+_PH_RE = re.compile(r'\{(\w+)\}')
+
+def _lit(s: str) -> str:
+    if not s:
+        return ""
+    core = r"\s*".join(re.escape(t) for t in s.split())
+    if not core:
+        return r"\s*"
+    return (r"\s*" if s[0].isspace() else "") + core + (r"\s*" if s[-1].isspace() else "")
+
+@lru_cache(maxsize=512)
+def compile_pattern(pattern: str):
+    """'S{season} - E{episode} [{quality} ⌯' -> regex. Raises ValueError if invalid."""
+    p = clean_text(pattern)
+    parts, last, seen = [], 0, set()
+    for m in _PH_RE.finditer(p):
+        name = m.group(1).lower()
+        if name not in _PLACEHOLDERS:
+            raise ValueError(f"Unknown variable {{{name}}}. Allowed: {{season}}, {{episode}}, {{quality}}")
+        parts.append(_lit(p[last:m.start()]))
+        if name in seen:
+            parts.append(f"(?P={name})")
+        else:
+            parts.append(f"(?P<{name}>{_PLACEHOLDERS[name]})")
+            seen.add(name)
+        last = m.end()
+    parts.append(_lit(p[last:]))
+    if not seen:
+        raise ValueError("Pattern must contain at least one of {season}, {episode}, {quality}")
+    return re.compile("".join(parts), re.IGNORECASE)
+
+def norm_quality(raw: str) -> str:
+    r = raw.lower()
+    if r in ('4k', '2160p', 'uhd'): return '4K'
+    if r in ('2k', '1440p', 'qhd'): return '2K'
+    if r == 'fhd': return '1080p'
+    if r in ('hd', 'sd'): return r.upper()
+    return r  # 720p, 1080p, 480p ...
+
+def quality_to_int(q) -> int:
+    if not q:
+        return 0
+    q = q.lower()
+    if q == '4k': return 4
+    if q == '2k': return 3
+    if q == 'hd': return 1
+    m = re.match(r'(\d+)', q)
+    if m:
+        h = int(m.group(1))
+        return 4 if h >= 2160 else 3 if h >= 1440 else 2 if h >= 1080 else 1 if h >= 720 else 0
+    return 0
+
+def detect_quality_str(text: str):
+    m = re.search(r'(?<!\d)(2160p|1440p|1080p|720p|576p|540p|480p|360p)', text, re.I)
+    if m:
+        return norm_quality(m.group(1))
+    m = re.search(r'(?<![a-z0-9])(4k|2k|uhd|qhd|fhd)(?![a-z0-9])', text, re.I)
+    return norm_quality(m.group(1)) if m else None
+
+def extract_variables(message, file_name: str, source: str, patterns: list) -> dict:
+    """1) default patterns  2) user's saved patterns (only fills what's missing).
+    source = 'filename' | 'caption'"""
+    raw = (getattr(message, "caption", None) or "") if source == "caption" else (file_name or "")
+    text = clean_text(raw)
+    season, _, episode = extract_file_info(text)
+    quality = detect_quality_str(text)
+    via = "default"
+    if patterns and (not season or not episode or not quality):
+        for p in patterns:
+            try:
+                m = compile_pattern(p).search(text)
+            except Exception:
+                continue
+            if not m:
+                continue
+            g = m.groupdict()
+            if not season and g.get('season'):
+                season = int(g['season']); via = "saved"
+            if not episode and g.get('episode'):
+                episode = int(g['episode']); via = "saved"
+            if not quality and g.get('quality'):
+                quality = norm_quality(g['quality']); via = "saved"
+            if season and episode and quality:
+                break
+    return {'season': season, 'episode': episode, 'quality': quality, 'via': via}
+
+async def get_variables(user_id: int, message, file_name: str) -> dict:
+    source = await db.get_id_source(user_id)
+    patterns = await load_patterns(user_id)
+    return extract_variables(message, file_name, source, patterns)
+
+# ---- Channel-backed pattern store -------------------------------------------
+# Each user's patterns live in ONE message inside the pattern channel
+# (header line + one pattern per line). MongoDB only keeps the message
+# reference (chat id + message id). Reads are cached in memory.
+_pattern_cache: Dict[int, List[str]] = {}
+_pattern_locks: Dict[int, asyncio.Lock] = {}
+
+def _pattern_lock(user_id: int) -> asyncio.Lock:
+    lock = _pattern_locks.get(user_id)
+    if lock is None:
+        lock = _pattern_locks[user_id] = asyncio.Lock()
+    return lock
+
+async def save_patterns(user_id: int, pats: List[str]):
+    """Write the user's full pattern list to the channel message. Raises on failure."""
+    chat_id = await db.get_pattern_channel()
+    if not chat_id:
+        raise RuntimeError("Pattern channel is not set")
+    ref = await db.get_pattern_ref(user_id)
+    if not pats:
+        if ref:
+            try:
+                await app.delete_messages(ref['chat_id'], ref['message_id'])
+            except Exception as e:
+                print(f"Pattern message delete error: {e}")
+            await db.clear_pattern_ref(user_id)
+        _pattern_cache[user_id] = []
+        return
+    text = f"PATTERNS | user_id={user_id}\n" + "\n".join(pats)
+    done = False
+    if ref and ref['chat_id'] == chat_id:
+        try:
+            await app.edit_message_text(
+                chat_id, ref['message_id'], text,
+                parse_mode=ParseMode.DISABLED, disable_web_page_preview=True
+            )
+            done = True
+        except Exception as e:
+            if type(e).__name__ == "MessageNotModified":
+                done = True
+            else:
+                print(f"Pattern message edit failed, creating a new one: {e}")
+    if not done:
+        sent = await app.send_message(
+            chat_id, text, parse_mode=ParseMode.DISABLED, disable_web_page_preview=True
+        )
+        await db.set_pattern_ref(user_id, sent.chat.id, sent.id)
+    _pattern_cache[user_id] = list(pats)
+
+async def _load_patterns_inner(user_id: int) -> List[str]:
+    ref = await db.get_pattern_ref(user_id)
+    pats = None
+    if ref:
+        try:
+            m = await app.get_messages(ref['chat_id'], ref['message_id'])
+            if m and not getattr(m, "empty", False) and m.text:
+                pats = [ln.strip() for ln in m.text.split("\n")[1:] if ln.strip()]
+            else:                       # message was deleted
+                await db.clear_pattern_ref(user_id)
+                pats = []
+        except Exception as e:
+            print(f"Pattern channel read error (user {user_id}): {e}")
+            return []                   # transient error: don't cache
+    if pats is None:
+        # Legacy: patterns saved earlier in MongoDB. Use them, and move them
+        # into the channel as soon as a pattern channel exists.
+        legacy = await db.get_patterns(user_id)
+        pats = list(legacy)
+        if legacy and await db.get_pattern_channel():
+            try:
+                await save_patterns(user_id, legacy)
+                await db.set_patterns(user_id, [])
+            except Exception as e:
+                print(f"Pattern migration error (user {user_id}): {e}")
+    _pattern_cache[user_id] = pats
+    return list(pats)
+
+async def load_patterns(user_id: int, _locked: bool = False) -> List[str]:
+    if user_id in _pattern_cache:
+        return list(_pattern_cache[user_id])
+    if _locked:
+        return await _load_patterns_inner(user_id)
+    async with _pattern_lock(user_id):
+        if user_id in _pattern_cache:
+            return list(_pattern_cache[user_id])
+        return await _load_patterns_inner(user_id)
+
+# ---- <bold> markers in /autorename and /set_caption -------------------------
+# "<Episode: {episode}>" -> "Episode: 05" (bold in caption, plain in file name).
+# Real HTML tags the user may already use (<b>, <i>, <code>, <a href=..> ...) are left alone.
+_B_OPEN, _B_CLOSE = "\uE000", "\uE001"
+_HTML_TAGS = r"(?:b|i|u|s|a|em|strong|code|pre|ins|del|strike|blockquote|tg-spoiler|tg-emoji|span)"
+_BOLD_RE = re.compile(r"<(?!/?" + _HTML_TAGS + r"(?:\s[^<>]*)?>)([^<>\n]+)>")
+
+def _mark_bold(t: str) -> str:
+    return _BOLD_RE.sub(lambda m: _B_OPEN + m.group(1) + _B_CLOSE, t)
+
+def _to_html_bold(t: str) -> str:
+    return _BOLD_RE.sub(lambda m: "<b>" + m.group(1) + "</b>", t)
+
+def _esc(t) -> str:
+    """Escape text so it is shown literally inside bot replies."""
+    return str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def _idsrc_buttons(cur: str):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"{'✅ ' if cur == 'filename' else ''}File Name", callback_data="set_idsrc_filename"),
+        InlineKeyboardButton(f"{'✅ ' if cur == 'caption' else ''}Caption", callback_data="set_idsrc_caption"),
+    ]])
+
 def check_template_needs_variables(format_template: str) -> set:
     needed = set()
     for var in ['{season}', '{episode}', '{quality}']:
@@ -937,6 +1307,23 @@ def check_count_conflict(template: str) -> bool:
     if not template or '{count}' not in template:
         return False
     return any(v in template for v in ['{season}', '{episode}', '{quality}'])
+
+def _cover_kwargs(cover_path):
+    """Different forks name the video-cover arg differently:
+    pyrofork -> `cover`, wzgram -> `video_cover`. Pick whichever the installed
+    send_video() actually accepts (a wrong kwarg raises TypeError)."""
+    if not cover_path:
+        return {}
+    try:
+        params = inspect.signature(Client.send_video).parameters
+    except Exception:
+        params = {}
+    for name in ("video_cover", "cover"):
+        if name in params:
+            return {name: cover_path}
+    print("⚠️ WARNING: installed Pyrogram fork has no video cover parameter; "
+          "only the small thumbnail will be used.")
+    return {}
 
 # ==================== FILE SENDING ====================
 async def _send_file(target_chat_id, output_path, send_as, final_filename, caption,
@@ -965,7 +1352,7 @@ async def _send_file(target_chat_id, output_path, send_as, final_filename, capti
                 # displays as the video's cover -- it is a *separate* field
                 # from `thumb` (which stays capped at 200KB/320px by
                 # Telegram itself, no matter what we upload for it).
-                cover=cover_path,
+                **_cover_kwargs(cover_path),
                 duration=duration,
                 file_name=final_filename,
                 progress=progress_for_pyrogram,
@@ -1077,24 +1464,36 @@ async def queue_worker():
                         processing_queue.current_task_id = None
                         asyncio.create_task(_trigger_manual_rename_if_ready(task_user_id))
                         continue
-                    try:
-                        await process_queue_file(message, task['user_id'], task)
-                        processing_queue.completed_tasks += 1
-                        processing_queue.mark_task_completed(task['task_id'], success=True)
-                        print(f"✅ Task completed successfully: {task['task_id']}")
-                    except asyncio.TimeoutError:
-                        print(f"⏰ Task {task['task_id']} timed out")
-                        processing_queue.failed_tasks += 1
+                    # Run as a separate asyncio.Task so the Cancel button /
+                    # /clear_queue can stop it at ANY stage (download, ffmpeg, upload).
+                    job = asyncio.create_task(process_queue_file(message, task['user_id'], task))
+                    processing_queue.current_job = job
+                    await asyncio.wait({job})
+                    if job.cancelled():
+                        print(f"🚫 Task cancelled: {task['task_id']}")
+                        processing_queue.cancelled_tasks += 1
                         processing_queue.mark_task_completed(task['task_id'], success=False)
-                    except Exception as e:
-                        print(f"❌ Error in task processing: {str(e)[:100]}")
-                        processing_queue.failed_tasks += 1
-                        processing_queue.mark_task_completed(task['task_id'], success=False)
+                    else:
+                        exc = job.exception()
+                        if exc is None:
+                            processing_queue.completed_tasks += 1
+                            processing_queue.mark_task_completed(task['task_id'], success=True)
+                            print(f"✅ Task completed successfully: {task['task_id']}")
+                        elif isinstance(exc, asyncio.TimeoutError):
+                            print(f"⏰ Task {task['task_id']} timed out")
+                            processing_queue.failed_tasks += 1
+                            processing_queue.mark_task_completed(task['task_id'], success=False)
+                        else:
+                            print(f"❌ Error in task processing: {str(exc)[:100]}")
+                            processing_queue.failed_tasks += 1
+                            processing_queue.mark_task_completed(task['task_id'], success=False)
                 except Exception as e:
                     print(f"❌ Error getting message: {e}")
                     processing_queue.failed_tasks += 1
                     processing_queue.mark_task_completed(task['task_id'], success=False)
                 finally:
+                    processing_queue.current_job = None
+                    processing_queue.forget_task(task)
                     processing_queue.is_processing = False
                     processing_queue.current_task = None
                     processing_queue.current_task_id = None
@@ -1152,24 +1551,13 @@ async def process_queue_file(message, user_id, task_info):
     base_name = os.path.splitext(file_name)[0]
     original_ext = os.path.splitext(file_name)[1] or ('.mp4' if media_type == 'video' else '.mp3')
 
-    season_int, _, episode_int = extract_file_info(file_name)
+    # Variables: default patterns first, then user's saved patterns (/add_pattern),
+    # read from file name or caption depending on /identify_from.
+    info = await get_variables(user_id, message, file_name)
+    season_int, episode_int = info['season'], info['episode']
     season = f"{season_int:02d}" if season_int else 'None'
     episode = f"{episode_int:02d}" if episode_int else 'None'
-
-    quality = "HD"
-    try:
-        if '4k' in file_name.lower() or '2160p' in file_name.lower():
-            quality = "4K"
-        elif '2k' in file_name.lower() or '1440p' in file_name.lower():
-            quality = "2K"
-        elif '1080p' in file_name.lower():
-            quality = "1080p"
-        elif '720p' in file_name.lower():
-            quality = "720p"
-        elif '480p' in file_name.lower():
-            quality = "480p"
-    except:
-        pass
+    quality = info['quality'] or "HD"
 
     manual_filename = task_info.get('manual_filename')
 
@@ -1231,7 +1619,8 @@ async def process_queue_file(message, user_id, task_info):
                     f"After all your current files are processed, the bot will ask you "
                     f"to provide the filename manually.\n\n"
                     f"**Failed queue size:** `{len(_get_failed_queue(user_id))}`\n"
-                    f"Use /failed_queue to view pending files."
+                    f"Use /failed_queue to view pending files.\n"
+                    f"💡 Teach the bot this format with /add_pattern."
                 )
             )
         except:
@@ -1254,7 +1643,7 @@ async def process_queue_file(message, user_id, task_info):
     if manual_filename is not None:
         new_filename = manual_filename
     else:
-        new_filename = format_template
+        new_filename = _mark_bold(format_template)
         replacements = {
             '{filename}': base_name,
             '{season}': season,
@@ -1268,6 +1657,8 @@ async def process_queue_file(message, user_id, task_info):
             new_filename = new_filename.replace(key, value)
 
     new_filename = re.sub(r'[<>:"/\\|?*]', '', new_filename)
+    bold_filename = new_filename        # still holds the bold markers
+    new_filename = new_filename.replace(_B_OPEN, "").replace(_B_CLOSE, "")
     final_filename = new_filename.strip() + display_ext
 
     try:
@@ -1276,7 +1667,8 @@ async def process_queue_file(message, user_id, task_info):
             f"**File:** `{file_name}`\n"
             f"**New Name:** `{final_filename[:50]}`\n"
             f"**Output Type:** `{send_as.upper()}`"
-            + (" _(Manual Rename)_" if manual_filename else "")
+            + (" _(Manual Rename)_" if manual_filename else ""),
+            reply_markup=_cancel_kb(task_info.get('task_id'))
         )
     except Exception as e:
         print(f"Error sending status message: {e}")
@@ -1284,13 +1676,14 @@ async def process_queue_file(message, user_id, task_info):
 
     download_path = f"downloads/{user_id}_{int(time.time())}{original_ext}"
     output_path = None
+    metadata_path = None
     thumb_path = None
     cover_path = None
     try:
         start_time = time.time()
         if status_msg:
             try:
-                await status_msg.edit_text(f"📥 **Downloading...**\n`{file_name}`")
+                await status_msg.edit_text(f"📥 **Downloading...**\n`{file_name}`", reply_markup=_cancel_kb())
             except:
                 pass
         try:
@@ -1313,7 +1706,7 @@ async def process_queue_file(message, user_id, task_info):
         file_size = os.path.getsize(file_path)
         if status_msg:
             try:
-                await status_msg.edit_text(f"✅ **Downloaded!**\n\n**Size:** {humanbytes(file_size)}\n\n⚙️ **Processing...**")
+                await status_msg.edit_text(f"✅ **Downloaded!**\n\n**Size:** {humanbytes(file_size)}\n\n⚙️ **Processing...**", reply_markup=_cancel_kb())
             except:
                 pass
 
@@ -1387,9 +1780,9 @@ async def process_queue_file(message, user_id, task_info):
                 thumb_path = None
 
         if caption_template is None:
-            caption = final_filename
+            caption = (bold_filename.strip() + display_ext).replace(_B_OPEN, "<b>").replace(_B_CLOSE, "</b>")
         else:
-            caption = caption_template.replace("{filename}", os.path.splitext(final_filename)[0])\
+            caption = _to_html_bold(caption_template).replace("{filename}", os.path.splitext(final_filename)[0])\
                                      .replace("{filesize}", humanbytes(file_size))\
                                      .replace("{duration}", str(timedelta(seconds=duration)) if duration else '00:00:00')\
                                      .replace("{season}", season)\
@@ -1399,7 +1792,7 @@ async def process_queue_file(message, user_id, task_info):
 
         if status_msg:
             try:
-                await status_msg.edit_text("📤 **Uploading renamed file...**")
+                await status_msg.edit_text("📤 **Uploading renamed file...**", reply_markup=_cancel_kb())
             except:
                 pass
 
@@ -1436,6 +1829,13 @@ async def process_queue_file(message, user_id, task_info):
                 except:
                     pass
             raise
+    except asyncio.CancelledError:
+        try:
+            if status_msg:
+                await status_msg.edit_text(f"🚫 **Task cancelled.**\n`{file_name}`", reply_markup=None)
+        except Exception:
+            pass
+        raise
     except asyncio.TimeoutError:
         error_text = "⏰ **Processing timeout!**"
         try:
@@ -1453,8 +1853,11 @@ async def process_queue_file(message, user_id, task_info):
             pass
         raise
     finally:
+        # also remove partial downloads (Pyrogram's *.temp) and half-written metadata file
         await cleanup_files(
             download_path,
+            *glob.glob(os.path.splitext(download_path)[0] + "*"),
+            metadata_path,
             output_path if output_path and output_path != download_path else None,
             thumb_path,
             cover_path,
@@ -1537,7 +1940,7 @@ async def private_file_handler(client, message):
         )
 
         try:
-            await message.reply_text(status_text)
+            await message.reply_text(status_text, reply_markup=_cancel_kb(task_id))
         except Exception as e:
             print(f"Error sending queue message: {e}")
 
@@ -1556,7 +1959,8 @@ async def private_file_handler(client, message):
      "admin_priority_on", "admin_priority_off", "clear_queue", "clear_queue_user",
      "stats", "ssequence", "esequence", "sequence_mode",
      "stop_renaming", "start_renaming",
-     "set_cover", "view_cover", "delete_cover", "set_channel", "register"]
+     "set_cover", "view_cover", "delete_cover", "set_channel", "register",
+     "add_pattern", "patterns", "del_pattern", "identify_from"]
 ))
 async def manual_rename_text_handler(client, message):
     user_id = message.from_user.id
@@ -1693,7 +2097,7 @@ async def autorename_handler(client, message):
                 "❌ **Invalid Format!**\n\n"
                 "`{count}` cannot be combined with `{season}`, `{episode}`, or `{quality}` in the same format. "
                 "When `{count}` is used, season/episode/quality are not scanned at all.\n\n"
-                f"**Your current active format:** `{current_template if current_template else 'Not set'}`\n\n"
+                f"**Your current active format:** `{_esc(current_template) if current_template else 'Not set'}`\n\n"
                 "Please correct your format and try again with just `{count}` OR the "
                 "season/episode/quality variables (not both)."
             )
@@ -1706,21 +2110,21 @@ async def autorename_handler(client, message):
             if current_count is None:
                 await message.reply_text(
                     f"**✅ Rename format set successfully!**\n\n"
-                    f"**Your format:** `{format_template}`\n\n"
+                    f"**Your format:** `{_esc(format_template)}`\n\n"
                     "⚠️ This format uses `{count}` but you haven't set a starting value yet.\n"
                     "Use `/count <number>` (e.g. `/count 1`) before sending files."
                 )
             else:
                 await message.reply_text(
                     f"**✅ Rename format set successfully!**\n\n"
-                    f"**Your format:** `{format_template}`\n\n"
+                    f"**Your format:** `{_esc(format_template)}`\n\n"
                     f"🔢 Current `{{count}}` value: `{current_count}` (will auto-increment per file)\n\n"
                     "Now send me any file to rename it automatically."
                 )
         else:
             await message.reply_text(
                 f"**✅ Rename format set successfully!**\n\n"
-                f"**Your format:** `{format_template}`\n\n"
+                f"**Your format:** `{_esc(format_template)}`\n\n"
                 "Now send me any file to rename it automatically."
             )
     except Exception as e:
@@ -1788,13 +2192,13 @@ async def set_caption_handler(client, message):
             await message.reply_text(
                 "❌ **Invalid Caption Format!**\n\n"
                 "`{count}` cannot be combined with `{season}`, `{episode}`, or `{quality}` in the same caption.\n\n"
-                f"**Your current active caption:** `{current_caption if current_caption else 'Not set'}`\n\n"
+                f"**Your current active caption:** `{_esc(current_caption) if current_caption else 'Not set'}`\n\n"
                 "Please correct your caption and try again."
             )
             return
 
         await db.set_caption(user_id, caption)
-        await message.reply_text(f"**✅ Caption format set successfully!**\n\n**Your caption:** `{caption}`")
+        await message.reply_text(f"**✅ Caption format set successfully!**\n\n**Your caption:** `{_esc(caption)}`")
     except Exception as e:
         print(f"Error in set_caption handler: {e}")
 
@@ -1806,7 +2210,7 @@ async def view_caption_handler(client, message):
         if caption:
             await message.reply_text(
                 f"**📝 Your Current Caption Format:**\n\n"
-                f"`{caption}`\n\n"
+                f"`{_esc(caption)}`\n\n"
                 "**Variables Available:**\n"
                 "- `{filename}`: Original filename\n"
                 "- `{filesize}`: File size\n"
@@ -2289,6 +2693,182 @@ async def delete_cover_handler(client, message):
     except Exception as e:
         print(f"Error in delete_cover handler: {e}")
 
+# ==================== CUSTOM PATTERNS & IDENTIFY SOURCE ====================
+@app.on_message(filters.channel & filters.text & filters.command("add_pattern_channel", prefixes="/"))
+async def add_pattern_channel_handler(client, message):
+    """Send /add_pattern_channel INSIDE the channel (bot must be admin there)."""
+    chat = message.chat
+    if message.from_user and message.from_user.id not in Config.ADMIN:
+        return
+    try:
+        member = await client.get_chat_member(chat.id, "me")
+        is_admin = member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+    except Exception as e:
+        print(f"Error checking admin status in channel {chat.id}: {e}")
+        is_admin = False
+    if not is_admin:
+        try:
+            await message.reply_text(
+                "❌ Please make this bot an **admin** with full permissions first, "
+                "then send /add_pattern_channel again."
+            )
+        except Exception:
+            pass
+        return
+    await db.set_pattern_channel(chat.id)
+    try:
+        await message.reply_text(
+            f"✅ **This channel is now the Pattern storage channel!**\n\n"
+            f"**Channel:** {chat.title or chat.id}\n**ID:** `{chat.id}`\n\n"
+            "Every user's saved patterns will be stored here (one message per user)."
+        )
+    except Exception:
+        pass
+    for admin_id in Config.ADMIN:
+        try:
+            await app.send_message(
+                admin_id,
+                f"✅ **Pattern channel registered via /add_pattern_channel**\n\n"
+                f"**Channel:** {chat.title or chat.id}\n**ID:** `{chat.id}`"
+            )
+        except Exception:
+            pass
+
+@app.on_message(filters.command("add_pattern") & filters.private)
+async def add_pattern_handler(client, message):
+    try:
+        user_id = message.from_user.id
+        await db.add_user(user_id)
+        parts = message.text.split(None, 1)
+        if len(parts) < 2:
+            await message.reply_text(
+                "**Usage:** `/add_pattern <pattern>`\n\n"
+                "**Variables:** `{season}` `{episode}` `{quality}`\n"
+                "**Example:** `/add_pattern S{season} -  E{episode} [{quality} ⌯`\n\n"
+                "Matches e.g. `Title S01 -  E02 [720p ⌯ Dual]` → season=01, episode=02, quality=720p.\n"
+                "Used only when the built-in patterns fail. /patterns to list, /del_pattern to remove."
+            )
+            return
+        if not await db.get_pattern_channel():
+            await message.reply_text(
+                "❌ **Pattern channel is not set up yet!**\n\n"
+                "Ask the bot admin to send `/add_pattern_channel` inside the pattern "
+                "storage channel (the bot must be admin there)."
+            )
+            return
+        # Emojis/stickers/zero-width chars are stripped (matching ignores them anyway).
+        pattern = clean_text(parts[1])
+        if not pattern:
+            await message.reply_text("❌ Pattern is empty after removing emojis/special symbols.")
+            return
+        if len(pattern) > 100:
+            await message.reply_text("❌ Pattern too long (max 100 chars).")
+            return
+        try:
+            compile_pattern(pattern)
+        except ValueError as e:
+            await message.reply_text(f"❌ **Invalid pattern:** {_esc(e)}")
+            return
+        except re.error as e:
+            await message.reply_text(f"❌ **Invalid pattern:** `{_esc(e)}`")
+            return
+        async with _pattern_lock(user_id):
+            existing = await load_patterns(user_id, _locked=True)
+            if pattern in existing:
+                await message.reply_text("ℹ️ This pattern is already saved.")
+                return
+            if len(existing) >= 30:
+                await message.reply_text("❌ Max 30 patterns. Remove some with /del_pattern.")
+                return
+            try:
+                await save_patterns(user_id, existing + [pattern])
+            except Exception as e:
+                await message.reply_text(
+                    f"❌ **Could not save to the pattern channel:** `{_esc(str(e)[:150])}`\n\n"
+                    "Make sure the bot is still an admin there."
+                )
+                return
+        await message.reply_text(
+            f"✅ **Pattern saved!** (#{len(existing) + 1})\n\n`{_esc(pattern)}`\n\n"
+            "Now resend the file that failed."
+        )
+    except Exception as e:
+        print(f"Error in add_pattern handler: {e}")
+
+@app.on_message(filters.command("patterns") & filters.private)
+async def patterns_handler(client, message):
+    try:
+        user_id = message.from_user.id
+        pats = await load_patterns(user_id)
+        src = await db.get_id_source(user_id)
+        if not pats:
+            await message.reply_text(
+                f"📭 No saved patterns.\n**Identify from:** `{src}`\n\nUse `/add_pattern <pattern>`."
+            )
+            return
+        text = f"📋 **Saved Patterns ({len(pats)})** — identify from: `{src}`\n\n"
+        for i, p in enumerate(pats, 1):
+            text += f"**{i}.** `{_esc(p)}`\n"
+        text += "\nRemove: `/del_pattern <number>` or `/del_pattern all`"
+        await message.reply_text(text)
+    except Exception as e:
+        print(f"Error in patterns handler: {e}")
+
+@app.on_message(filters.command("del_pattern") & filters.private)
+async def del_pattern_handler(client, message):
+    try:
+        user_id = message.from_user.id
+        if len(message.command) < 2:
+            await message.reply_text("**Usage:** `/del_pattern <number>` or `/del_pattern all`")
+            return
+        arg = message.command[1].lower()
+        async with _pattern_lock(user_id):
+            pats = await load_patterns(user_id, _locked=True)
+            if arg == "all":
+                try:
+                    await save_patterns(user_id, [])
+                except Exception as e:
+                    await message.reply_text(f"❌ Could not update the pattern channel: `{_esc(str(e)[:150])}`")
+                    return
+                await message.reply_text(f"✅ Removed all {len(pats)} pattern(s).")
+                return
+            if not arg.isdigit() or not (1 <= int(arg) <= len(pats)):
+                await message.reply_text("❌ Invalid number. See /patterns.")
+                return
+            new_list = list(pats)
+            removed = new_list.pop(int(arg) - 1)
+            try:
+                await save_patterns(user_id, new_list)
+            except Exception as e:
+                await message.reply_text(f"❌ Could not update the pattern channel: `{_esc(str(e)[:150])}`")
+                return
+        await message.reply_text(f"✅ Removed: `{_esc(removed)}`")
+    except Exception as e:
+        print(f"Error in del_pattern handler: {e}")
+
+@app.on_message(filters.command("identify_from") & filters.private)
+async def identify_from_handler(client, message):
+    try:
+        user_id = message.from_user.id
+        await db.add_user(user_id)
+        if len(message.command) >= 2:
+            src = message.command[1].lower()
+            src = "filename" if src in ("filename", "file", "name") else src
+            if src not in ("filename", "caption"):
+                await message.reply_text("❌ Use `/identify_from filename` or `/identify_from caption`.")
+                return
+            await db.set_id_source(user_id, src)
+            await message.reply_text(f"✅ Variables will now be identified from: `{src}`")
+            return
+        cur = await db.get_id_source(user_id)
+        await message.reply_text(
+            f"**🔍 Identify variables from**\n\nCurrent: `{cur}`\n\n"
+            "Default patterns run first, then your saved patterns (/add_pattern).",
+            reply_markup=_idsrc_buttons(cur)
+        )
+    except Exception as e:
+        print(f"Error in identify_from handler: {e}")
+
 @app.on_message(filters.command("failed_queue") & filters.private)
 async def failed_queue_handler(client, message):
     user_id = message.from_user.id
@@ -2530,22 +3110,37 @@ async def admin_priority_off_handler(client, message):
 
 @app.on_message(filters.command("clear_queue") & filters.private)
 async def clear_queue_handler(client, message):
+    """ADMIN: stop the running task and clear every queue (all users, incl. admin)."""
     try:
-        if message.from_user.id not in Config.ADMIN:
+        admin_id = message.from_user.id
+        if admin_id not in Config.ADMIN:
             await message.reply_text("❌ **Admin only command!**")
             return
-        queue_length = processing_queue.get_queue_length()
-        processing_queue.clear_queue()
+        users, removed, stopped = processing_queue.clear_all()
+        failed_cleared = sum(len(v) for v in failed_rename_queue.values())
+        failed_rename_queue.clear()
+        manual_rename_waiting.clear()
         await message.reply_text(
-            f"✅ **Queue cleared successfully!**\n\n"
-            f"• Removed `{queue_length}` waiting tasks\n"
-            f"• Queue is now empty"
+            f"✅ **Everything cleared!**\n\n"
+            f"• Waiting tasks removed: `{removed}`\n"
+            f"• Running task stopped: `{'Yes' if stopped else 'No'}`\n"
+            f"• Failed/manual-rename entries cleared: `{failed_cleared}`\n"
+            f"• Users affected: `{len(users)}`"
         )
+        for uid in users:
+            if uid == admin_id:
+                continue
+            try:
+                await app.send_message(uid, "⚠️ **Your queued/processing files were cleared by an admin.**")
+            except Exception:
+                pass
     except Exception as e:
         print(f"Error in clear_queue handler: {e}")
 
 @app.on_message(filters.command("clear_queue_user") & filters.private)
 async def clear_queue_user_handler(client, message):
+    """EVERYONE: clears the caller's own waiting files (admins too).
+    Admins may pass a user id to clear someone else's."""
     try:
         user_id = message.from_user.id
         target_id = user_id
@@ -2560,14 +3155,14 @@ async def clear_queue_user_handler(client, message):
                 return
         removed_count, has_current = await processing_queue.clear_user_queue(target_id)
         if removed_count == 0 and not has_current:
-            await message.reply_text("❌ No pending files in queue for this user.")
-        else:
-            response = ""
-            if removed_count > 0:
-                response += f"✅ Cleared `{removed_count}` waiting file(s) from the queue.\n"
-            if has_current:
-                response += "ℹ️ One file is currently being processed and cannot be stopped."
-            await message.reply_text(response)
+            await message.reply_text("❌ No pending files in queue.")
+            return
+        response = ""
+        if removed_count > 0:
+            response += f"✅ Cleared `{removed_count}` waiting file(s) from the queue.\n"
+        if has_current:
+            response += "ℹ️ A file is being processed right now — tap **❌ Cancel** on its status message to stop it."
+        await message.reply_text(response)
     except Exception as e:
         print(f"Error in clear_queue_user handler: {e}")
 
@@ -2759,7 +3354,9 @@ async def callback_query_handler(client, callback_query):
                 return
 
             files = sequence_sessions[session_user_id]['files']
-            sorted_files = sorted(files, key=lambda m: sort_key_for_mode(m, mode))
+            id_source = await db.get_id_source(user_id)
+            id_patterns = await load_patterns(user_id)
+            sorted_files = sorted(files, key=lambda m: sort_key_for_mode(m, mode, id_source, id_patterns))
             sequence_sessions[session_user_id]['sorted_files'] = sorted_files
             sequence_sessions[session_user_id]['mode'] = mode
 
@@ -2775,7 +3372,7 @@ async def callback_query_handler(client, callback_query):
                 except Exception as e:
                     print(f"Failed to forward file during sorting: {e}")
 
-            summary = generate_sort_summary(sorted_files, mode)
+            summary = generate_sort_summary(sorted_files, mode, id_source, id_patterns)
             buttons = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🚀 Add to Queue (in order)", callback_data=f"enqueue_seq_{session_user_id}")],
                 [InlineKeyboardButton("❌ Cancel", callback_data="cancel_seq")]
@@ -2821,6 +3418,37 @@ async def callback_query_handler(client, callback_query):
             await callback_query.message.edit_text("❌ Sequence session cancelled.")
             await callback_query.answer("Cancelled.")
 
+        elif data.startswith("cancel_task_"):
+            tid = data[len("cancel_task_"):]
+            task = processing_queue.task_map.get(tid)
+            if task is None and processing_queue.current_task_id == tid:
+                task = processing_queue.current_task
+            if task is None:
+                await callback_query.answer("This task is already finished.", show_alert=True)
+                try:
+                    await callback_query.message.edit_reply_markup(None)
+                except Exception:
+                    pass
+                return
+            if user_id != task['user_id'] and user_id not in Config.ADMIN:
+                await callback_query.answer("This is not your task.", show_alert=True)
+                return
+            result = processing_queue.cancel_task(tid)
+            if result == 'running':
+                await callback_query.answer("Cancelling…")
+            elif result == 'queued':
+                await callback_query.answer("Removed from queue.")
+                try:
+                    await callback_query.message.edit_text("🚫 **Removed from queue.**", reply_markup=None)
+                except Exception:
+                    pass
+            else:
+                await callback_query.answer("This task is already finished.", show_alert=True)
+                try:
+                    await callback_query.message.edit_reply_markup(None)
+                except Exception:
+                    pass
+
         elif data.startswith("set_mediatype_"):
             media = data.split("_")[2]
             if media not in ["document", "video", "audio"]:
@@ -2841,6 +3469,21 @@ async def callback_query_handler(client, callback_query):
                 f"**🎬 Output media type updated!**\n\nCurrent: `{current}`",
                 reply_markup=buttons
             )
+
+        elif data.startswith("set_idsrc_"):
+            src = data.split("_", 2)[2]
+            if src not in ("filename", "caption"):
+                await callback_query.answer("Invalid")
+                return
+            await db.set_id_source(user_id, src)
+            await callback_query.answer(f"Identifying from {src}", show_alert=True)
+            try:
+                await callback_query.message.edit_text(
+                    f"**🔍 Identify variables from**\n\nCurrent: `{src}`",
+                    reply_markup=_idsrc_buttons(src)
+                )
+            except Exception:
+                pass
 
         else:
             if callback_query.data == 'help':
@@ -3022,7 +3665,7 @@ async def main():
             f"**Username:** @{me.username}\n"
             f"**ID:** `{me.id}`\n"
             f"**Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            f"**Build:** Simplified (rename + metadata + thumbnail + sequence sort only)."
+            f"**Build:** Simplified (rename + metadata + thumbnail + sequence sort + custom patterns)."
         )
     except:
         pass
@@ -3049,6 +3692,7 @@ if __name__ == "__main__":
     print("⏸️ Renaming control: /stop_renaming, /start_renaming")
     print("🔄 Sequence: 3 sort modes — /ssequence, /esequence, /sequence_mode [1|2|3]")
     print("🔢 Counter: /count [number] to view/set {count} starting value")
+    print("🧩 Patterns: /add_pattern, /patterns, /del_pattern, /identify_from")
     print("🤖 Bot is running. Press Ctrl+C to stop.")
     print("="*60 + "\n")
     try:
